@@ -1,0 +1,182 @@
+[
+    {
+        "api_name": "/api/importTree",
+        "method": "POST",
+        "request": {"file_name": "<file_name>"},
+        "response": {"node_master": "<node_master>"},
+        "response_type": "dictionary",
+        "description": "Used to import an existing decision tree. The request must include the path of the saved tree, as defined in tree.json. Returns node_master as defined in node_master.json."
+    },
+    {
+        "api_name": "/api/upload",
+        "method": "POST",
+        "request": {"file_name": "<file_name>"},
+        "response": {"rows": "<rows>", "columns": "<columns>", "sample": "<sample>", "columnsList": "<column_names>"},
+        "response_type": "mixed, containing 2 integers and 2 jsons",
+        "description": "Used to upload a file containing raw development data in .csv format. Returns the number of rows, columns, a sample of 5 records, and a list of columns."
+    },
+    {
+        "api_name": "/api/setTarget",
+        "method": "POST",
+        "request": {"target": "<target_variable>"},
+        "response": {"message": "<confirmation_message>"},
+        "response_type": "string",
+        "description": "Sets the target variable for the decision tree model."
+    },
+    {
+        "api_name": "/api/getTypes",
+        "method": "GET",
+        "request": {},
+        "response": {"<column_name>":"<data_type>", ...},
+        response_type: "dictionary",
+		"description":"Returns data types for each column except the target variable."
+    },
+    {
+		"api_name":" /api/keepVar", 
+		"method":" POST", 
+		"request":{"<column_name>":"<datatype>", ...}, 
+		"response":{"columnsList":["<column_names_list>"]}, 
+		response_type: "dictionary",
+		description:"Decides which variables to keep (only categorical and numerical), as provided in request"
+   },
+   {
+       api_name: /api/defineHP,
+       method: POST,
+       request: {max_depth:<max_depth>, min_node_split:<min_node_split>, min_leaf_size:<min_leaf_size>, max_branches:<max_branches>, criteria:<criteria>, unique_var:<unique_var>, monotonous:<monotonous>}
+       response:{'max_depth': <max_depth>,
+            'min_node_split':<min_node_split>,
+            'min_leaf_size': <min_leaf_size>,
+            'max_branches': <max_branches>,
+            'criteria': <criteria>,
+            'unique_var': <unique_var>,
+            'monotonous': <monotonous>}
+      response_type: "mixed, 4 integers, 1 string, 2 boolean",	
+      description:"Initializes Decision Tree Hyperparameters with default values or provided values."
+   },
+   {
+       api_name: /api/initTree,
+       method: POST,
+       request:{},
+       response:{node_master:<node_master_records>}
+       response_type: "dictionary",
+       description:"Initializes Decision Tree with Root node using global parameters and dataset. Returns node_master as defined in node_master.json"
+   },
+   {
+      api_name:/api/autoTree,
+      method: POST,
+      request:{},
+      response:{node_master:<node_master_records>}
+      response_type: "dictionary"
+      description:"Trains entire tree automatically using Hyperparameters provided. Returns node_master as defined in node_master.json"  
+   },
+   {
+     api_name:/api/delSubTree
+     method: POST
+     request:{node_number:<node_number>}
+     response:{node_master:<updated_node_master_records>}
+     response_type: "dictionary"
+     description:"Deletes subtree starting from specified node number. Returns node_master as defined in node_master.json"  
+   },
+   {
+        "api_name": "/api/autoTrainSubTree",
+        "method": "POST",
+        "request": {"node_number": "<node_number>"},
+        "response": {"node_master": "<node_master_records>"},
+        "response_type": "dictionary",
+        "description": "Automatically trains a subtree starting from the specified node number. Returns the updated node_master as defined in node_master.json"
+   },
+   {
+        "api_name": "/api/findSplit",
+        "method": "POST",
+        "request": {"node_number": "<node_number>"},
+        "response": {"node_master": "<updated_node_master_records>"},
+        "response_type": "dictionary",
+        "description": "Finds the best split for a given node and updates the tree structure. Returns the updated node_master as defined in node_master.json"
+    },
+    {
+        "api_name": "/api/findVar",
+        "method": "POST",
+        "request": {"node_number": "<node_number>"},
+        "response": {"top_vars": "<top_variables_records>"},
+        "response_type": "dictionary",
+        "description": "Identifies the top variables for splitting at a given node. Returns a list of top variables, along with their information values (in descending order of IV)"
+    },
+    {
+        "api_name": "/api/bestSplit",
+        "method": "POST",
+        "request": {"node_number": "<node_number>", 	"variable_name":"<variable_name>"},
+		"response":{"best_split":"<best_split_records>"}, 
+		"response_type":"dictionary", 
+		"description":"Finds best split for given variable at specified node. Returns details of best split as defined in best_split.json"
+    },
+    {
+      	"api_name":" /api/evalSplit", 
+      	"method":" POST", 
+      	"request":{"node_number":"<node_number>", 	"splits":[{"split_details"}]}, 
+      	"response":{"best_split":"<evaluated_best_split>"}, 
+      	"response_type":"dictionary", 
+      	"description":"Evaluates provided splits for specified node, returns best evaluated split as defined in best_split.json"
+   },
+   {
+      api_name: /api/addNode,
+      method: POST,
+      request: {node_number:<node_number>, splits:[{split_details}]},
+      response:{'node_master': <updated_node_master_records>}
+      response_type: dictionary,
+      description:"Adds new nodes to tree based on provided splits and updates tree structure. Returns node_master as defined in node_master.json"  
+   },
+   {
+     api_name:/api/copyNode,
+     method: POST,
+     request:{from_node:<from_node>, to_node:<to_node>},
+     response:{'node_master': <updated_node_master_records>}
+     response_type: dictionary
+     description:"Copies subtree from one node to another within the decision tree. Returns node_master as defined in node_master.json"  
+   },
+   {
+     api_name:/api/labelNode,
+     method: POST,
+     request:{node_number:<node_number>, label:<label>},
+     response:{'node_master': <updated_node_master_with_label>}
+     response_type: dictionary
+     description:"Labels a specific node with provided label and updates tree structure. Returns node_master as defined in node_master.json"  
+   },
+   {
+     api_name:/api/exportTree,
+     method: GET,
+     request:{},
+     response:{
+            'file_name': '<file_name>',
+            'badflag':'<badflag>',
+            'max_depth': <max_depth>,
+            'min_node_split':<min_node_split>,
+            'min_leaf_size': <min_leaf_size>,
+            'max_branches': <max_branches>,
+            'criteria': '<criteria>',
+            'unique_var': '<unique_var>',
+            'monotonous': '<monotonous>',
+            'mapper': '<mapper_records>',
+            'node_master': '<exported_node_master>'}
+      response_type: json
+      description:"Exports current state of decision tree as JSON object with all relevant parameters."  
+   },
+   {
+     api_name:/api/downloadTree,
+     method: GET,
+     request:{},
+     response:{
+            'file_name': '<file_name>',
+            'badflag':'<badflag>',
+            'max_depth': <max_depth>,
+            'min_node_split':<min_node_split>,
+            'min_leaf_size': <min_leaf_size>,
+            'max_branches': <max_branches>,
+            'criteria': '<criteria>',
+            'unique_var': '<unique_var>',
+            'monotonous': '<monotonous>',
+            'mapper': '<mapper_records>',
+            'node_master': '<exported_node_master>'}
+      response_type: json
+      description:"Exports current state of decision tree as JSON object with all relevant parameters. Dumps into file as defined in tree.json"  
+   }
+]

@@ -1,0 +1,105 @@
+[
+	{
+		"schema":
+			{
+				"var_name": "all_records",
+				"var_type": "integer",
+				"description": "number of records in the branch"
+			},
+			{
+				"var_name": "event_rate",
+				"var_type": "float",
+				"description": "events / all_records"
+			},
+			{
+				"var_name": "events",
+				"var_type": "integer",
+				"description": "number of records where target variable = 1"
+			},
+			{
+				"var_name": "list_values",
+				"var_type": "string",
+				"description": "values of variable that qualify for the current branch"
+			},
+			{
+				"var_name": "lower_bound",
+				"var_type": "integer",
+				"description": "lower bound of values of variable that qualify for current branch"
+			},
+			{
+				"var_name": "missing",
+				"var_type": "boolean",
+				"description": "whether or not missing values should be included in this branch"
+			},
+			{
+				"var_name": "upper_bound",
+				"var_type": "integer",
+				"description": "upper bound of values of variable that qualify for current branch"
+			},
+			{
+				"var_name": "variable",
+				"var_type": "string",
+				"description": "variable used for the current split"
+			}
+		"samples":
+			{'all_records': 4208,
+			'event_rate': 0.019249049429657796,
+			'events': 81,
+			'list_values': ['Airports',
+			'Quasi cash',
+			'Music stores',
+			'Restaurants',
+			'Food',
+			'Govt services'],
+			'lower_bound': -0.001,
+			'missing': 0,
+			'upper_bound': 5.0,
+			'variable': 'Merchant_category'},
+			{'all_records': 5588,
+			'event_rate': 0.02541159627773801,
+			'events': 142,
+			'list_values': ['Fuel'],
+			'lower_bound': 5.0,
+			'missing': 0,
+			'upper_bound': 6.0,
+			'variable': 'Merchant_category'},
+			{'all_records': 25010,
+			'event_rate': 0.03946421431427429,
+			'events': 987,
+			'list_values': ['Hotels',
+			'Contracted services',
+			'Digital goods',
+			'Transportation services',
+			'Alcohol',
+			'Cloth stores',
+			'Professional services & memberships',
+			'Dept stores',
+			'Airline',
+			'Railways',
+			'Misc Services',
+			'Medical',
+			'Business Services',
+			'Retail',
+			'Home furnishing',
+			'Insurance'],
+			'lower_bound': 6.0,
+			'missing': 0,
+			'upper_bound': 22.0,
+			'variable': 'Merchant_category'},
+			{'all_records': 15194,
+			'event_rate': 0.0927997893905489,
+			'events': 1410,
+			'list_values': ['Education',
+			'Auto',
+			'Books & stationery',
+			'Direct marketing',
+			'Rent Payments',
+			'Utility',
+			'Electronics',
+			'Wallet load'],
+			'lower_bound': 22.0,
+			'missing': 0,
+			'upper_bound': 30.0,
+			'variable': 'Merchant_category'}
+	}
+]
