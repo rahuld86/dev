@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 import pandas as pd
 import numpy as np
 import os
@@ -11,6 +12,112 @@ from util import (
     find_var, best_split, eval_split, add_nodes, copy_node_wrapper, 
     add_label, classify_dtype, create_node_datasets, find_var_regression, best_split_regression
 )
+
+# S3 support
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+    print("Warning: boto3 not available. S3 functionality will be disabled.")
+
+def get_s3_client():
+    """Get S3 client with credentials from environment variables"""
+    if not S3_AVAILABLE:
+        return None
+    
+    try:
+        return boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION', 'us-east-1')
+        )
+    except Exception as e:
+        print(f"Warning: Could not initialize S3 client: {e}")
+        return None
+
+def is_s3_path(path):
+    """Check if path is an S3 path (s3://bucket/key)"""
+    return path and (path.startswith('s3://') or path.startswith('s3a://') or path.startswith('s3n://'))
+
+def parse_s3_path(s3_path):
+    """Parse S3 path into bucket and key"""
+    if not s3_path:
+        return None, None
+    
+    # Remove protocol
+    path = s3_path.replace('s3://', '').replace('s3a://', '').replace('s3n://', '')
+    
+    # Split into bucket and key
+    parts = path.split('/', 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    elif len(parts) == 1:
+        return parts[0], ''
+    else:
+        return None, None
+
+def download_from_s3(s3_path, local_path):
+    """Download file from S3 to local path"""
+    if not S3_AVAILABLE:
+        raise ValueError("S3 support not available. Please install boto3.")
+    
+    bucket, key = parse_s3_path(s3_path)
+    if not bucket:
+        raise ValueError(f"Invalid S3 path: {s3_path}. Missing bucket name. Format: s3://bucket/key")
+    if not key:
+        raise ValueError(f"Invalid S3 path: {s3_path}. Missing key/path. Format: s3://bucket/key")
+    
+    s3_client = get_s3_client()
+    if not s3_client:
+        raise ValueError("Could not initialize S3 client. Check AWS credentials.")
+    
+    try:
+        # First check if the object exists
+        s3_client.head_object(Bucket=bucket, Key=key)
+        # If exists, download it
+        s3_client.download_file(bucket, key, local_path)
+        print(f"Successfully downloaded {s3_path} to {local_path}")
+        return local_path
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code == '404' or error_code == 'NoSuchKey':
+            raise ValueError(f"File not found in S3: {s3_path}. Please verify:\n"
+                           f"1. The bucket name is correct: {bucket}\n"
+                           f"2. The file path/key is correct: {key}\n"
+                           f"3. The file exists in the S3 bucket\n"
+                           f"4. You have read permissions for this S3 object")
+        elif error_code == '403' or error_code == 'AccessDenied':
+            raise ValueError(f"Access denied for S3 path: {s3_path}. Please check:\n"
+                           f"1. AWS credentials have read permissions for bucket: {bucket}\n"
+                           f"2. The file/key exists and you have access: {key}")
+        else:
+            raise ValueError(f"Failed to download from S3: {str(e)}\n"
+                           f"Bucket: {bucket}, Key: {key}")
+
+def upload_to_s3(local_path, s3_path):
+    """Upload file from local path to S3"""
+    if not S3_AVAILABLE:
+        raise ValueError("S3 support not available. Please install boto3.")
+    
+    bucket, key = parse_s3_path(s3_path)
+    if not bucket:
+        raise ValueError(f"Invalid S3 path: {s3_path}. Missing bucket name.")
+    if not key:
+        raise ValueError(f"Invalid S3 path: {s3_path}. Missing key/path. Format: s3://bucket/key")
+    
+    s3_client = get_s3_client()
+    if not s3_client:
+        raise ValueError("Could not initialize S3 client. Check AWS credentials.")
+    
+    try:
+        s3_client.upload_file(local_path, bucket, key)
+        print(f"Successfully uploaded {local_path} to {s3_path}")
+        return s3_path
+    except ClientError as e:
+        raise ValueError(f"Failed to upload to S3: {str(e)}")
 
 def df_to_json_safe(df):
     """Convert DataFrame to JSON-safe format by replacing NaN with None"""
@@ -35,13 +142,39 @@ def df_to_json_safe(df):
     # Additional cleanup for any remaining NaN values
     for record in result:
         for key, value in record.items():
-            if pd.isna(value) if hasattr(pd, 'isna') else (value != value):  # NaN check
-                record[key] = None
+            # Skip NA check for container types; lists (e.g., list_values) are valid JSON
+            if isinstance(value, (list, tuple, dict)):
+                continue
+            try:
+                is_na = pd.isna(value) if hasattr(pd, 'isna') else (value != value)
+                # If is_na is array-like, treat as not-NA to avoid ambiguous truth
+                if isinstance(is_na, (np.ndarray, pd.Series)):
+                    is_na = False
+                if is_na:
+                    record[key] = None
+            except Exception:
+                # On any check failure, leave the value as-is
+                pass
     
     return result
 
 app = Flask(__name__)
-CORS(app)
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Configure CORS for production
+CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
+
+# Configure JWT
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'change-this-secret-key')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 86400))  # 24 hours default
+jwt = JWTManager(app)
+
+# Import auth utilities
+from auth import verify_user
 
 # Global state management - better than scattered global variables
 class TreeState:
@@ -64,7 +197,7 @@ class TreeState:
         self.max_branches = 5
         self.criteria = "entropy"
         self.unique_var = 0
-        self.monotonous = 0
+        self.monotonic = 0
         self.regression_flag = 0
 
 # Initialize global state
@@ -96,7 +229,57 @@ def test():
     """Test endpoint to verify backend is working"""
     return jsonify({"message": "Backend is working", "timestamp": str(datetime.now())})
 
+@app.route('/api/login', methods=['POST'])
+def login():
+    """Login endpoint - authenticates user and returns JWT token"""
+    try:
+        data = request.get_json()
+        if not data:
+            return handle_error("No JSON data provided", 400)
+        
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
+        
+        if not username or not password:
+            return handle_error("Username and password are required", 400)
+        
+        # Verify credentials
+        if verify_user(username, password):
+            # Create JWT token
+            access_token = create_access_token(identity=username)
+            return jsonify({
+                'access_token': access_token,
+                'username': username,
+                'message': 'Login successful'
+            })
+        else:
+            return handle_error("Invalid username or password", 401)
+    
+    except Exception as e:
+        return handle_error(f"Login error: {str(e)}", 500)
+
+@app.route('/api/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    """Logout endpoint - returns success message (JWT is stateless)"""
+    return jsonify({"message": "Logout successful"})
+
+@app.route('/api/user', methods=['GET'])
+@jwt_required()
+def get_current_user():
+    """Get current authenticated user info"""
+    username = get_jwt_identity()
+    return jsonify({"username": username})
+
+@app.route('/api/verify', methods=['GET'])
+@jwt_required()
+def verify_token():
+    """Verify JWT token validity"""
+    username = get_jwt_identity()
+    return jsonify({"valid": True, "username": username})
+
 @app.route('/api/importTree', methods=['POST'])
+@jwt_required()
 def importTree():
     """Import an existing decision tree from JSON file"""
     try:
@@ -178,8 +361,31 @@ def importTree():
             if file_name.lower().endswith('.csv'):
                 print("CSV file detected in URL case - routing to upload endpoint")
                 # For CSV files, we need to process them like the upload endpoint
+                # Check if it's an S3 path
+                if is_s3_path(file_name):
+                    # Handle S3 - download the file
+                    try:
+                        # Create uploads directory if it doesn't exist
+                        upload_dir = os.path.join(os.getcwd(), 'uploads')
+                        os.makedirs(upload_dir, exist_ok=True)
+                        
+                        # Generate unique filename
+                        import uuid
+                        unique_filename = f"{uuid.uuid4()}_s3_downloaded.csv"
+                        file_path = os.path.join(upload_dir, unique_filename)
+                        
+                        # Download from S3
+                        download_from_s3(file_name, file_path)
+                        
+                        # Load CSV file
+                        tree_state.df = pd.read_csv(file_path)
+                        tree_state.file_name = file_path
+                        tree_state.original_data_source = file_name  # Store original S3 path
+                        
+                    except Exception as e:
+                        return handle_error(f"Failed to download file from S3: {str(e)}", 400)
                 # Check if it's a URL or local file path
-                if file_name.startswith(('http://', 'https://')):
+                elif file_name.startswith(('http://', 'https://')):
                     # Handle URL - download the file
                     import requests
                     import tempfile
@@ -251,13 +457,66 @@ def importTree():
                 })
             else:
                 # Handle JSON file
-                # Validate file exists
-                is_valid, error_msg = validate_file_exists(file_name)
-                if not is_valid:
-                    return handle_error(error_msg, 404)
-                
-                with open(file_name, "r") as f:
-                    data = json.load(f)
+                # Check if it's an S3 path
+                if is_s3_path(file_name):
+                    # Handle S3 - download the file first
+                    try:
+                        # Create uploads directory if it doesn't exist
+                        upload_dir = os.path.join(os.getcwd(), 'uploads')
+                        os.makedirs(upload_dir, exist_ok=True)
+                        
+                        # Generate unique filename
+                        import uuid
+                        unique_filename = f"{uuid.uuid4()}_s3_imported.json"
+                        file_path = os.path.join(upload_dir, unique_filename)
+                        
+                        # Download from S3
+                        download_from_s3(file_name, file_path)
+                        
+                        # Load JSON from downloaded file
+                        with open(file_path, "r") as f:
+                            data = json.load(f)
+                        print(f"Successfully loaded JSON tree from S3: {file_name}")
+                        
+                    except Exception as e:
+                        return handle_error(f"Failed to download JSON file from S3: {str(e)}", 400)
+                elif file_name.startswith(('http://', 'https://')):
+                    # Handle URL - download the file first
+                    import requests
+                    
+                    try:
+                        response = requests.get(file_name)
+                        response.raise_for_status()
+                        
+                        # Create uploads directory if it doesn't exist
+                        upload_dir = os.path.join(os.getcwd(), 'uploads')
+                        os.makedirs(upload_dir, exist_ok=True)
+                        
+                        # Generate unique filename
+                        import uuid
+                        unique_filename = f"{uuid.uuid4()}_downloaded.json"
+                        file_path = os.path.join(upload_dir, unique_filename)
+                        
+                        # Save downloaded file
+                        with open(file_path, 'wb') as f:
+                            f.write(response.content)
+                        
+                        # Load JSON from downloaded file
+                        with open(file_path, "r") as f:
+                            data = json.load(f)
+                        print(f"Successfully loaded JSON tree from URL: {file_name}")
+                        
+                    except requests.RequestException as e:
+                        return handle_error(f"Failed to download JSON file from URL: {str(e)}", 400)
+                else:
+                    # Handle local file path
+                    # Validate file exists
+                    is_valid, error_msg = validate_file_exists(file_name)
+                    if not is_valid:
+                        return handle_error(error_msg, 404)
+                    
+                    with open(file_name, "r") as f:
+                        data = json.load(f)
         
         # Load tree configuration
         tree_state.file_name = data.get("file_name")
@@ -268,7 +527,7 @@ def importTree():
         tree_state.max_branches = data.get("max_branches", 5)
         tree_state.criteria = data.get("criteria", "entropy")
         tree_state.unique_var = data.get("unique_var", 0)
-        tree_state.monotonous = data.get("monotonous", 0)
+        tree_state.monotonic = data.get("monotonic", 0)
         tree_state.df_col = pd.DataFrame(data.get("mapper"))
         node_master_read = pd.DataFrame(data.get("node_master"))
         
@@ -283,8 +542,31 @@ def importTree():
         if original_file_name and original_file_name.lower().endswith('.csv'):
             print("JSON contains CSV file path - processing as CSV import")
             try:
+                # Check if it's an S3 path
+                if is_s3_path(original_file_name):
+                    # Handle S3 - download the file
+                    try:
+                        # Create uploads directory if it doesn't exist
+                        upload_dir = os.path.join(os.getcwd(), 'uploads')
+                        os.makedirs(upload_dir, exist_ok=True)
+                        
+                        # Generate unique filename
+                        import uuid
+                        unique_filename = f"{uuid.uuid4()}_s3_imported.csv"
+                        file_path = os.path.join(upload_dir, unique_filename)
+                        
+                        # Download from S3
+                        download_from_s3(original_file_name, file_path)
+                        
+                        # Load CSV file
+                        tree_state.df = pd.read_csv(file_path)
+                        print(f"Successfully loaded data from S3: {original_file_name}")
+                        
+                    except Exception as e:
+                        print(f"Failed to download from S3: {e}. Creating mock dataset...")
+                        raise e
                 # Check if it's a URL or local file path
-                if original_file_name.startswith(('http://', 'https://')):
+                elif original_file_name.startswith(('http://', 'https://')):
                     # Handle URL - download the file
                     import requests
                     import tempfile
@@ -464,6 +746,7 @@ def importTree():
         return handle_error(str(e))
 
 @app.route('/api/getImportDiagnostics', methods=['GET'])
+@jwt_required()
 def getImportDiagnostics():
     """Get diagnostic information about the imported tree data"""
     try:
@@ -510,7 +793,8 @@ def getImportDiagnostics():
                 'max_branches': tree_state.max_branches,
                 'criteria': tree_state.criteria,
                 'unique_var': tree_state.unique_var,
-                'monotonous': tree_state.monotonous
+                'monotonic': tree_state.monotonic,
+                'regression_flag': tree_state.regression_flag
             },
             'feature_columns': list(tree_state.X_col) if tree_state.X_col is not None else [],
             'df_for_tree_shape': tree_state.df_for_tree.shape if tree_state.df_for_tree is not None else None
@@ -525,6 +809,7 @@ def getImportDiagnostics():
         return handle_error(str(e))
 
 @app.route('/api/upload', methods=['POST'])
+@jwt_required()
 def upload_csv():
     """Upload and validate CSV file"""
     try:
@@ -571,8 +856,31 @@ def upload_csv():
             
             file_name = data.get("file")
             
+            # Check if it's an S3 path
+            if is_s3_path(file_name):
+                # Handle S3 - download the file
+                try:
+                    # Create uploads directory if it doesn't exist
+                    upload_dir = os.path.join(os.getcwd(), 'uploads')
+                    os.makedirs(upload_dir, exist_ok=True)
+                    
+                    # Generate unique filename
+                    import uuid
+                    unique_filename = f"{uuid.uuid4()}_s3_downloaded.csv"
+                    file_path = os.path.join(upload_dir, unique_filename)
+                    
+                    # Download from S3
+                    download_from_s3(file_name, file_path)
+                    
+                    # Load CSV file
+                    tree_state.df = pd.read_csv(file_path)
+                    tree_state.file_name = file_path
+                    tree_state.original_data_source = file_name  # Store original S3 path
+                    
+                except Exception as e:
+                    return handle_error(f"Failed to download file from S3: {str(e)}", 400)
             # Check if it's a URL or local file path
-            if file_name.startswith(('http://', 'https://')):
+            elif file_name.startswith(('http://', 'https://')):
                 # Handle URL - download the file
                 import requests
                 import tempfile
@@ -638,6 +946,7 @@ def upload_csv():
         return handle_error(str(e))
 
 @app.route('/api/setTarget', methods=['POST'])
+@jwt_required()
 def setTarget():
     """Set target variable for the decision tree"""
     try:
@@ -669,7 +978,17 @@ def setTarget():
     except Exception as e:
         return handle_error(str(e))
 
+@app.route('/api/getRegressionFlag', methods=['GET'])
+@jwt_required()
+def getRegressionFlag():
+    """Return current regression/classification mode flag"""
+    try:
+        return jsonify({"regression_flag": tree_state.regression_flag})
+    except Exception as e:
+        return handle_error(str(e))
+
 @app.route('/api/getTypes', methods=['GET'])
+@jwt_required()
 def getTypes():
     """Get data types for all columns except target variable"""
     try:
@@ -690,6 +1009,7 @@ def getTypes():
         return handle_error(str(e))
 
 @app.route('/api/keepVar', methods=['POST'])
+@jwt_required()
 def keepVar():
     """Select variables to keep for tree building"""
     try:
@@ -738,6 +1058,7 @@ def keepVar():
         return handle_error(str(e))
 
 @app.route('/api/defineHP', methods=['POST'])
+@jwt_required()
 def defineHP():
     """Define hyperparameters for decision tree"""
     try:
@@ -748,7 +1069,7 @@ def defineHP():
         tree_state.max_branches = 5
         tree_state.criteria = "entropy"
         tree_state.unique_var = 0
-        tree_state.monotonous = 0
+        tree_state.monotonic = 0
         
         # Override with provided values
         data = request.get_json(silent=True) or {}
@@ -758,7 +1079,7 @@ def defineHP():
         tree_state.max_branches = data.get("max_branches", tree_state.max_branches)
         tree_state.criteria = data.get("criteria", tree_state.criteria)
         tree_state.unique_var = data.get("unique_var", tree_state.unique_var)
-        tree_state.monotonous = data.get("monotonous", tree_state.monotonous)
+        tree_state.monotonic = data.get("monotonic", tree_state.monotonic)
         
         return jsonify({
             'max_depth': tree_state.max_depth,
@@ -767,13 +1088,14 @@ def defineHP():
             'max_branches': tree_state.max_branches,
             'criteria': tree_state.criteria,
             'unique_var': tree_state.unique_var,
-            'monotonous': tree_state.monotonous
+            'monotonic': tree_state.monotonic
         })
     
     except Exception as e:
         return handle_error(str(e))
 
 @app.route('/api/initTree', methods=['POST'])
+@jwt_required()
 def initTree():
     """Initialize decision tree with root node"""
     try:
@@ -791,6 +1113,7 @@ def initTree():
         return handle_error(str(e))
 
 @app.route('/api/autoTree', methods=['POST'])
+@jwt_required()
 def autoTree():
     """Train entire tree automatically"""
     try:
@@ -800,7 +1123,8 @@ def autoTree():
         tree_state.node_master, tree_state.node_datasets = build_tree(
             tree_state.df_for_tree, 'badflag', tree_state.max_depth, 
             tree_state.min_node_split, tree_state.min_leaf_size, 
-            tree_state.max_branches, tree_state.df_col, tree_state.regression_flag
+            tree_state.max_branches, tree_state.df_col, tree_state.regression_flag,
+            tree_state.monotonic, tree_state.unique_var
         )
         
         return jsonify({"node_master": df_to_json_safe(tree_state.node_master)})
@@ -809,6 +1133,7 @@ def autoTree():
         return handle_error(str(e))
 
 @app.route('/api/delSubTree', methods=['POST'])
+@jwt_required()
 def delSubTree():
     """Delete subtree starting from specified node"""
     try:
@@ -851,6 +1176,7 @@ def delSubTree():
         return handle_error(str(e))
 
 @app.route('/api/autoTrainSubTree', methods=['POST'])
+@jwt_required()
 def autoTrainSubTree():
     """Automatically train subtree from specified node"""
     try:
@@ -908,6 +1234,7 @@ def autoTrainSubTree():
         return handle_error(f"Auto train failed: {str(e)}")
 
 @app.route('/api/findSplit', methods=['POST'])
+@jwt_required()
 def findSplit():
     """Find best split for specified node"""
     try:
@@ -928,7 +1255,8 @@ def findSplit():
         tree_state.node_master, tree_state.node_datasets = split_node(
             node_number, tree_state.min_leaf_size, tree_state.max_branches, 
             tree_state.max_depth, tree_state.min_node_split, tree_state.X_col, 
-            tree_state.node_master, tree_state.node_datasets, 'badflag', tree_state.df_col, tree_state.regression_flag
+            tree_state.node_master, tree_state.node_datasets, 'badflag', tree_state.df_col, tree_state.regression_flag,
+            tree_state.monotonic, []
         )
         
         return jsonify({"node_master": df_to_json_safe(tree_state.node_master)})
@@ -937,6 +1265,7 @@ def findSplit():
         return handle_error(str(e))
 
 @app.route('/api/findVar', methods=['POST'])
+@jwt_required()
 def findVar():
     """Find top variables for splitting at specified node"""
     try:
@@ -971,6 +1300,7 @@ def findVar():
         return handle_error(str(e))
 
 @app.route('/api/bestSplit', methods=['POST'])
+@jwt_required()
 def bestSplit():
     """Find best split for specified variable at specified node"""
     try:
@@ -1008,6 +1338,7 @@ def bestSplit():
         return handle_error(str(e))
 
 @app.route('/api/evalSplit', methods=['POST'])
+@jwt_required()
 def evalSplit():
     """Evaluate provided splits for specified node"""
     try:
@@ -1043,8 +1374,34 @@ def evalSplit():
         if 'list_values' not in df.columns:
             df['list_values'] = [[] for _ in range(len(df))]  # Default empty list
         else:
-            # Ensure list_values are properly formatted as lists
-            df['list_values'] = df['list_values'].apply(lambda x: x if isinstance(x, list) else [x] if x is not None else [])
+            # Ensure list_values are properly formatted as flat lists of scalars
+            def normalize_list_values(x):
+                if x is None:
+                    return []
+                if isinstance(x, list):
+                    # If contains numpy arrays/Series, flatten them
+                    out = []
+                    for v in x:
+                        try:
+                            import numpy as np
+                            import pandas as pd
+                            if isinstance(v, (np.ndarray, pd.Series)):
+                                out.extend(list(v))
+                            else:
+                                out.append(v)
+                        except Exception:
+                            out.append(v)
+                    return out
+                try:
+                    import numpy as np
+                    import pandas as pd
+                    if isinstance(x, (np.ndarray, pd.Series)):
+                        return list(x)
+                except Exception:
+                    pass
+                return [x]
+
+            df['list_values'] = df['list_values'].apply(normalize_list_values)
         
         df_out = eval_split(node_number, tree_state.node_datasets, 'badflag', df, tree_state.df_col)
         
@@ -1054,6 +1411,7 @@ def evalSplit():
         return handle_error(str(e))
 
 @app.route('/api/addNode', methods=['POST'])
+@jwt_required()
 def addNode():
     """Add new nodes based on provided splits"""
     try:
@@ -1087,6 +1445,34 @@ def addNode():
         # Use list_values from input data if provided, otherwise default to empty list
         if 'list_values' not in df.columns:
             df['list_values'] = [[] for _ in range(len(df))]
+        else:
+            # Normalize list_values to flat lists of scalars
+            def normalize_list_values(x):
+                if x is None:
+                    return []
+                if isinstance(x, list):
+                    out = []
+                    for v in x:
+                        try:
+                            import numpy as np
+                            import pandas as pd
+                            if isinstance(v, (np.ndarray, pd.Series)):
+                                out.extend(list(v))
+                            else:
+                                out.append(v)
+                        except Exception:
+                            out.append(v)
+                    return out
+                try:
+                    import numpy as np
+                    import pandas as pd
+                    if isinstance(x, (np.ndarray, pd.Series)):
+                        return list(x)
+                except Exception:
+                    pass
+                return [x]
+
+            df['list_values'] = df['list_values'].apply(normalize_list_values)
         
         tree_state.node_master, tree_state.node_datasets = add_nodes(
             df, node_number, tree_state.max_depth, tree_state.min_node_split, 
@@ -1099,6 +1485,7 @@ def addNode():
         return handle_error(str(e))
 
 @app.route('/api/copyNode', methods=['POST'])
+@jwt_required()
 def copyNode():
     """Copy subtree from one node to another"""
     try:
@@ -1128,6 +1515,7 @@ def copyNode():
         return handle_error(str(e))
 
 @app.route('/api/labelNode', methods=['POST'])
+@jwt_required()
 def labelNode():
     """Add label to specified node"""
     try:
@@ -1153,13 +1541,59 @@ def labelNode():
     except Exception as e:
         return handle_error(str(e))
 
-@app.route('/api/exportTree', methods=['GET'])
+@app.route('/api/exportTree', methods=['GET', 'POST'])
+@jwt_required()
 def exportTree():
-    """Export current tree state as JSON"""
+    """Export current tree state as JSON. Optionally upload to S3 if s3_path is provided."""
     try:
         if tree_state.node_master is None:
             return handle_error("No tree to export. Please initialize tree first.", 400)
         
+        # Check if S3 path is provided
+        s3_path = None
+        if request.method == 'POST':
+            data = request.get_json()
+            if data and 's3_path' in data:
+                s3_path = data.get('s3_path')
+        
+        # If S3 path provided, upload to S3
+        if s3_path:
+            if not is_s3_path(s3_path):
+                return handle_error("Invalid S3 path format. Expected format: s3://bucket/key", 400)
+            
+            # Create temporary file with export data
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+                export_data = {
+                    'file_name': tree_state.original_data_source or tree_state.file_name,
+                    'badflag': tree_state.badflag,
+                    'max_depth': tree_state.max_depth,
+                    'min_node_split': tree_state.min_node_split,
+                    'min_leaf_size': tree_state.min_leaf_size,
+                    'max_branches': tree_state.max_branches,
+                    'criteria': tree_state.criteria,
+                    'unique_var': tree_state.unique_var,
+                    'monotonic': tree_state.monotonic,
+                    'mapper': df_to_json_safe(tree_state.df_col),
+                    'node_master': df_to_json_safe(tree_state.node_master)
+                }
+                json.dump(export_data, tmp_file, indent=2)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Upload to S3
+                upload_to_s3(tmp_path, s3_path)
+                os.unlink(tmp_path)  # Clean up temp file
+                return jsonify({
+                    'message': f'Tree exported successfully to {s3_path}',
+                    's3_path': s3_path,
+                    'export_data': export_data
+                })
+            except Exception as e:
+                os.unlink(tmp_path)  # Clean up temp file on error
+                return handle_error(f"Failed to upload to S3: {str(e)}", 500)
+        
+        # Return JSON response
         return jsonify({
             'file_name': tree_state.file_name,
             'badflag': tree_state.badflag,
@@ -1169,7 +1603,7 @@ def exportTree():
             'max_branches': tree_state.max_branches,
             'criteria': tree_state.criteria,
             'unique_var': tree_state.unique_var,
-            'monotonous': tree_state.monotonous,
+            'monotonic': tree_state.monotonic,
             'mapper': df_to_json_safe(tree_state.df_col),
             'node_master': df_to_json_safe(tree_state.node_master)
         })
@@ -1177,12 +1611,22 @@ def exportTree():
     except Exception as e:
         return handle_error(str(e))
 
-@app.route('/api/downloadTree', methods=['GET'])
+@app.route('/api/downloadTree', methods=['GET', 'POST'])
+@jwt_required()
 def downloadTree():
-    """Download current tree state as JSON file"""
+    """Download current tree state as JSON file. Optionally upload to S3 if s3_path is provided."""
     try:
         if tree_state.node_master is None:
             return handle_error("No tree to download. Please initialize tree first.", 400)
+        
+        # Check if S3 path is provided
+        s3_path = None
+        if request.method == 'POST':
+            data = request.get_json()
+            if data and 's3_path' in data:
+                s3_path = data.get('s3_path')
+        elif request.method == 'GET':
+            s3_path = request.args.get('s3_path')
         
         data = {
             'file_name': tree_state.original_data_source or tree_state.file_name,  # Use original data source if available
@@ -1193,11 +1637,35 @@ def downloadTree():
             'max_branches': tree_state.max_branches,
             'criteria': tree_state.criteria,
             'unique_var': tree_state.unique_var,
-            'monotonous': tree_state.monotonous,
+            'monotonic': tree_state.monotonic,
             'mapper': df_to_json_safe(tree_state.df_col),
             'node_master': df_to_json_safe(tree_state.node_master)
         }
         
+        # If S3 path provided, upload to S3
+        if s3_path:
+            if not is_s3_path(s3_path):
+                return handle_error("Invalid S3 path format. Expected format: s3://bucket/key", 400)
+            
+            # Create temporary file with export data
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+                json.dump(data, tmp_file, indent=2)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Upload to S3
+                upload_to_s3(tmp_path, s3_path)
+                os.unlink(tmp_path)  # Clean up temp file
+                return jsonify({
+                    'message': f'Tree downloaded successfully to {s3_path}',
+                    's3_path': s3_path
+                })
+            except Exception as e:
+                os.unlink(tmp_path)  # Clean up temp file on error
+                return handle_error(f"Failed to upload to S3: {str(e)}", 500)
+        
+        # Return file download
         json_str = json.dumps(data, indent=2)
         response = Response(
             json_str,
@@ -1210,6 +1678,7 @@ def downloadTree():
         return handle_error(str(e))
 
 @app.route('/api/getTreeData', methods=['GET'])
+@jwt_required()
 def getTreeData():
     """Get current tree data"""
     try:
@@ -1221,10 +1690,76 @@ def getTreeData():
     except Exception as e:
         return handle_error(str(e))
 
+@app.route('/api/uploadFileToS3', methods=['POST'])
+@jwt_required()
+def uploadFileToS3():
+    """Upload file content to S3"""
+    try:
+        data = request.get_json()
+        if not data:
+            return handle_error("No JSON data provided", 400)
+        
+        # Validate required fields
+        is_valid, error_msg = validate_required_fields(data, ["content", "filename", "s3_path"])
+        if not is_valid:
+            return handle_error(error_msg, 400)
+        
+        content = data.get("content")
+        filename = data.get("filename")
+        content_type = data.get("content_type", "text/plain")
+        s3_path = data.get("s3_path")
+        
+        # Validate S3 path
+        if not is_s3_path(s3_path):
+            return handle_error("Invalid S3 path format. Expected format: s3://bucket/key", 400)
+        
+        # Create temporary file with content
+        import tempfile
+        import base64
+        
+        # Handle base64 content for binary files (images)
+        if content_type.startswith('image/'):
+            # Content is base64 encoded, decode it first
+            try:
+                # Remove data URL prefix if present
+                if ',' in content:
+                    base64_content = content.split(',')[1]
+                else:
+                    base64_content = content
+                decoded_content = base64.b64decode(base64_content)
+                with tempfile.NamedTemporaryFile(mode='wb', suffix=f"_{filename}", delete=False) as tmp_file:
+                    tmp_file.write(decoded_content)
+                    tmp_path = tmp_file.name
+            except Exception as e:
+                return handle_error(f"Invalid base64 content: {str(e)}", 400)
+        else:
+            # Regular text content
+            with tempfile.NamedTemporaryFile(mode='w', suffix=f"_{filename}", delete=False, encoding='utf-8') as tmp_file:
+                tmp_file.write(content)
+                tmp_path = tmp_file.name
+        
+        try:
+            # Upload to S3
+            upload_to_s3(tmp_path, s3_path)
+            os.unlink(tmp_path)  # Clean up temp file
+            return jsonify({
+                'message': f'File uploaded successfully to {s3_path}',
+                's3_path': s3_path
+            })
+        except Exception as e:
+            os.unlink(tmp_path)  # Clean up temp file on error
+            return handle_error(f"Failed to upload to S3: {str(e)}", 500)
+    
+    except Exception as e:
+        return handle_error(str(e))
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({"status": "healthy", "message": "Decision Tree API is running"})
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Development server only
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    port = int(os.getenv('FLASK_PORT', '5000'))
+    app.run(debug=debug_mode, host='0.0.0.0', port=port)
